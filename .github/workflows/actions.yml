@@ -1,0 +1,99 @@
+name: Fast Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      SERVER_ADDRESS:
+        description: 'Server address (IP or domain)'
+        required: true
+        default: 'example.com'
+      SERVER_USERNAME:
+        description: 'SSH username'
+        required: true
+        default: 'user'
+      SERVER_FULL_URL:
+        description: 'user@host for SSH'
+        required: true
+        default: 'user@example.com'
+      ENV_FILE:
+        description: 'Environment file contents'
+        required: true
+        default: ''
+      DEPLOY_PATH:
+        description: 'Deploy path on server'
+        required: true
+        default: '~/app'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.STAGE_SERVER_PRIVATE_KEY }}
+
+      - name: Add SSH key to known_hosts
+        run: ssh-keyscan -H "${{ github.event.inputs.SERVER_ADDRESS }}" >> ~/.ssh/known_hosts
+
+      - name: Check if services exist and cleanup
+        run: |
+          ssh ${{ github.event.inputs.SERVER_FULL_URL }} "if [ -d ${{ github.event.inputs.DEPLOY_PATH }} ] && [ -f ${{ github.event.inputs.DEPLOY_PATH }}/deploy/stage/docker-compose.yml ]; then cd ${{ github.event.inputs.DEPLOY_PATH }} && echo 'Stopping existing services...' && docker compose -f deploy/stage/docker-compose.yml down; else echo 'No existing services found'; fi"
+
+      - name: Copy files to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ github.event.inputs.SERVER_ADDRESS }}
+          username: ${{ github.event.inputs.SERVER_USERNAME }}
+          key: ${{ secrets.STAGE_SERVER_PRIVATE_KEY }}
+          source: "."
+          target: ${{ github.event.inputs.DEPLOY_PATH }}
+          rm: true
+          exclude: ".git,.github,node_modules,__pycache__,*.pyc"
+
+      - name: Create environment file and deploy
+        run: |
+          ssh ${{ github.event.inputs.SERVER_FULL_URL }} << 'EOF'
+            cd ${{ github.event.inputs.DEPLOY_PATH }}
+            echo "${{ github.event.inputs.ENV_FILE }}" > ./.env.stage
+            if ! docker network ls --filter name=stage_app_network --format '{{.Name}}' | grep -w stage_app_network; then
+              docker network create stage_app_network
+            fi
+            docker compose -f deploy/stage/docker-compose.yml up -d --build --wait --wait-timeout 120
+            docker compose -f deploy/stage/docker-compose.yml ps
+          EOF
+
+      - name: Update Onion
+        run: |
+          ssh ${{ github.event.inputs.SERVER_FULL_URL }} << 'EOF'
+            cd ${{ github.event.inputs.DEPLOY_PATH }}
+            chmod +x update-onion.sh
+            ./update-onion.sh
+          EOF
+
+      - name: Update DJANGO_ALLOWED_HOSTS in .env.stage
+        run: |
+          ssh ${{ github.event.inputs.SERVER_FULL_URL }} << 'EOF'
+            cd ${{ github.event.inputs.DEPLOY_PATH }}
+            ONION_ADDR=$(grep '^ONION_ADDRESS=' .env.dev | cut -d'=' -f2)
+            if [ -z "$ONION_ADDR" ]; then
+              echo "Не удалось получить onion-адрес из .env.dev!"
+              exit 1
+            fi
+            if grep -q '^DJANGO_ALLOWED_HOSTS=' .env.stage; then
+              sed -i "s|^DJANGO_ALLOWED_HOSTS=.*|DJANGO_ALLOWED_HOSTS=$ONION_ADDR|" .env.stage
+            else
+              echo "DJANGO_ALLOWED_HOSTS=$ONION_ADDR" >> .env.stage
+            fi
+            echo "✓ DJANGO_ALLOWED_HOSTS обновлен: $ONION_ADDR"
+          EOF
+
+      - name: Restart Containers
+        run: |
+          ssh ${{ github.event.inputs.SERVER_FULL_URL }} << 'EOF'
+            cd ${{ github.event.inputs.DEPLOY_PATH }}
+            docker compose -f deploy/stage/docker-compose.yml up nginx django react -d --force-recreate
+          EOF
