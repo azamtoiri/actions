@@ -1,6 +1,6 @@
-def main():
-    print("Hello from actions!")
+def master():
+    print("Master function called")
 
 
 if __name__ == "__main__":
-    main()
+    master()
